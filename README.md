@@ -1,4 +1,4 @@
-# Table Tennis Leaderboard Bot
+# Leaderboard dashboard Bot
 
 This project provides a Python script to generate and display a table tennis leaderboard. It fetches match data from an AppSheet application, calculates player rankings using the Elo rating system, and sends leaderboard reports to a Telegram group.
 

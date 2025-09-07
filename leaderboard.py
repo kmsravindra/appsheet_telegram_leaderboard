@@ -275,6 +275,148 @@ class PlayerRankingSystem:
         plt.close(fig)
         return buf
 
+    def generate_comprehensive_performance_matrix(self, period='all_time'):
+        """Generates a comprehensive matrix showing head-to-head results in W-L format with color coding."""
+        # Filter matches based on period
+        today = datetime.now()
+        
+        if period == 'weekly':
+            start_date = (today - timedelta(days=today.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+            filtered_matches = [m for m in self.match_history if m['date'] >= start_date]
+            period_title = "This Week's"
+        elif period == 'monthly':
+            start_date = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            filtered_matches = [m for m in self.match_history if m['date'] >= start_date]
+            period_title = "This Month's"
+        else:  # all_time
+            filtered_matches = self.match_history
+            period_title = "All-Time"
+        
+        # Get all players who have played matches in this period
+        all_players = sorted(list(set(m['winner'] for m in filtered_matches) | set(m['loser'] for m in filtered_matches)))
+        
+        if len(all_players) < 2:
+            return None
+            
+        # Create matrices for wins and losses
+        n_players = len(all_players)
+        wins_matrix = [[0 for _ in range(n_players)] for _ in range(n_players)]
+        losses_matrix = [[0 for _ in range(n_players)] for _ in range(n_players)]
+        
+        # Create player index mapping
+        player_to_index = {player: i for i, player in enumerate(all_players)}
+        
+        # Populate matrices with match data from filtered matches
+        for match in filtered_matches:
+            winner = match['winner']
+            loser = match['loser']
+            
+            winner_idx = player_to_index[winner]
+            loser_idx = player_to_index[loser]
+            
+            # Winner beat loser
+            wins_matrix[winner_idx][loser_idx] += 1
+            # Loser lost to winner
+            losses_matrix[loser_idx][winner_idx] += 1
+        
+        # Create combined matrix with W-L format and win ratios for coloring
+        combined_matrix = []
+        color_matrix = []
+        
+        for i in range(n_players):
+            combined_row = []
+            color_row = []
+            for j in range(n_players):
+                if i == j:
+                    # Diagonal - no games against self
+                    combined_row.append("---")
+                    color_row.append(0)  # Neutral color
+                else:
+                    wins = wins_matrix[i][j]
+                    losses = losses_matrix[i][j]
+                    total_games = wins + losses
+                    
+                    if total_games == 0:
+                        combined_row.append("0-0")
+                        color_row.append(-1)  # Special value for white color (no games)
+                    else:
+                        combined_row.append(f"{wins}-{losses}")
+                        # Color based on win ratio (0 to 1)
+                        win_ratio = wins / total_games
+                        color_row.append(win_ratio)
+            
+            combined_matrix.append(combined_row)
+            color_matrix.append(color_row)
+        
+        # Create the visualization
+        plt.style.use('seaborn-v0_8-whitegrid')
+        fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+        
+        # Convert to DataFrames
+        color_df = pd.DataFrame(color_matrix, index=all_players, columns=all_players)
+        
+        # Create custom colormap: white for no games, then light yellow to dark blue
+        from matplotlib.colors import LinearSegmentedColormap
+        colors = ['#ffffff', '#ffffcc', '#a1dab4', '#41b6c4', '#2c7fb8', '#253494']  # White -> Light yellow -> Light teal -> Medium teal -> Blue -> Dark blue
+        n_bins = 100
+        cmap = LinearSegmentedColormap.from_list('win_loss', colors, N=n_bins)
+        
+        # Plot heatmap with custom annotations and improved readability
+        sns.heatmap(color_df, annot=False, cmap=cmap, ax=ax, 
+                   cbar_kws={'label': 'Win Ratio'}, square=True, 
+                   vmin=-1, vmax=1, linewidths=1.5, linecolor='#333333')
+        
+        # Add alternating row bands for better readability
+        for i in range(n_players):
+            if i % 2 == 1:  # Every other row
+                ax.axhspan(i, i+1, facecolor='black', alpha=0.05, zorder=0)
+        
+        # Add alternating column bands for better readability  
+        for j in range(n_players):
+            if j % 2 == 1:  # Every other column
+                ax.axvspan(j, j+1, facecolor='black', alpha=0.05, zorder=0)
+        
+        # Add custom annotations (W-L format with opponent names)
+        for i in range(n_players):
+            for j in range(n_players):
+                text = combined_matrix[i][j]
+                opponent_name = all_players[j]
+                
+                if text == "---":
+                    # Same player - show name only
+                    display_text = f"{opponent_name}"
+                    ax.text(j + 0.5, i + 0.5, display_text, ha='center', va='center', 
+                           fontsize=8, weight='bold', color='black')
+                elif text == "0-0":
+                    # No matches - show opponent name and 0-0
+                    display_text = f"{opponent_name}\n{text}"
+                    ax.text(j + 0.5, i + 0.5, display_text, ha='center', va='center', 
+                           fontsize=7, color='gray')
+                else:
+                    # Has matches - show opponent name and W-L record
+                    display_text = f"{opponent_name}\n{text}"
+                    # Choose text color based on background (optimized for blue color scheme)
+                    win_ratio = color_matrix[i][j]
+                    text_color = 'white' if win_ratio > 0.6 else 'black'
+                    ax.text(j + 0.5, i + 0.5, display_text, ha='center', va='center', 
+                           fontsize=7, weight='bold', color=text_color)
+        
+        ax.set_title(f'🎯 {period_title} Head-to-Head Results (W-L Format)', fontsize=16, weight='bold', pad=20)
+        ax.set_xlabel('Opponent (Column)', fontsize=12)
+        ax.set_ylabel('Player (Row)', fontsize=12)
+        
+        # Rotate labels for better readability
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        
+        plt.tight_layout()
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+
     def generate_head_to_head_chart(self, player_name):
         """Generates a bar chart of wins for a specific player against their opponents."""
         wins = {}
@@ -357,7 +499,12 @@ def get_metrics_explanation():
     """Returns a formatted string explaining the leaderboard metrics."""
     return (
         "📊 *Understanding the Leaderboard Metrics*\n\n"
-        "Here’s a quick guide to the terms you'll see in the charts:\n\n"
+        "Here's a quick guide to the terms you'll see in the charts:\n\n"
+        "🎯 *Head-to-Head Matrix (W-L Format)*:\n"
+        "   - Shows records between every pair of players for different time periods\n"
+        "   - Format: 'Wins-Losses' (e.g., '3-1' = 3 wins, 1 loss against that opponent)\n"
+        "   - White = no matches played, Light Yellow = struggling, Light Blue = competitive, Dark Blue = dominating\n"
+        "   - Find your name on the left (row), look across to see your record vs each opponent\n\n"
         "1️⃣. *Elo*:\n"
         "   - This is your long-term *skill rating* based on your entire match history.\n"
         "   - It goes up when you win and down when you lose.\n"
@@ -384,6 +531,23 @@ def main():
     ranking_system = PlayerRankingSystem(data)
     
     send_telegram_message(get_metrics_explanation())
+
+    # --- Comprehensive Performance Matrices for Different Periods ---
+    
+    # All-time comprehensive matrix
+    comprehensive_chart_all = ranking_system.generate_comprehensive_performance_matrix('all_time')
+    if comprehensive_chart_all:
+        send_telegram_photo(comprehensive_chart_all, caption="🎯 *All-Time Head-to-Head Overview*: Complete historical record between all players. Format: 'Wins-Losses' (e.g., '3-1' = 3 wins, 1 loss). Color intensity shows dominance level.")
+    
+    # Weekly comprehensive matrix (if there are weekly matches)
+    comprehensive_chart_weekly = ranking_system.generate_comprehensive_performance_matrix('weekly')
+    if comprehensive_chart_weekly:
+        send_telegram_photo(comprehensive_chart_weekly, caption="📅 *This Week's Head-to-Head*: Shows only matches from this week. Format: 'Wins-Losses'. Great for seeing current week dynamics!")
+    
+    # Monthly comprehensive matrix (if there are monthly matches)
+    comprehensive_chart_monthly = ranking_system.generate_comprehensive_performance_matrix('monthly')
+    if comprehensive_chart_monthly:
+        send_telegram_photo(comprehensive_chart_monthly, caption="🗓️ *This Month's Head-to-Head*: Shows only matches from this month. Format: 'Wins-Losses'. Track monthly rivalries!")
 
     # --- Weekly Leaderboard ---
     weekly_lb, weekly_name = ranking_system.generate_leaderboard('weekly')

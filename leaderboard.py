@@ -6,14 +6,24 @@ from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import seaborn as sns
 import io
+import gspread
+from google.oauth2.service_account import Credentials
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
+from dotenv import load_dotenv
+
+# --- Load Environment Variables from .env file ---
+load_dotenv()
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Securely Load Configuration from Environment Variables ---
-APPSHEET_APP_ID = os.environ.get("APPSHEET_APP_ID")
-APPSHEET_ACCESS_KEY = os.environ.get("APPSHEET_ACCESS_KEY")
-APPSHEET_TABLE_NAME = os.environ.get("APPSHEET_TABLE_NAME", "ASPTTDailyScores") # Default table name if not set
+GOOGLE_SHEETS_ID = os.environ.get("GOOGLE_SHEETS_ID")
+GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME")
+GOOGLE_SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -51,6 +61,13 @@ class PlayerRankingSystem:
         }
 
         self.match_history = self._preprocess_data(match_data)
+        
+        # Debug: Log match processing results
+        logging.info(f"Processed {len(self.match_history)} matches from {len(match_data)} records")
+        if self.match_history:
+            logging.info(f"Date range: {self.match_history[0]['date']} to {self.match_history[-1]['date']}")
+            logging.info(f"Sample processed match: {self.match_history[0]}")
+        
         self._calculate_elo_ratings()
 
     def _normalize_player_name(self, name):
@@ -69,28 +86,80 @@ class PlayerRankingSystem:
         if not match_data:
             return processed_matches
         for record in match_data:
-            if not all(k in record for k in ['Date', 'Player 1', 'Player 2', 'Winner', 'Final Score']):
-                continue
             try:
-                # Use the new, robust normalization function
-                p1_name = self._normalize_player_name(record['Player 1'])
-                p2_name = self._normalize_player_name(record['Player 2'])
-                winner_name = self._normalize_player_name(record['Winner'])
+                # Handle the new Google Sheets format: Timestamp, Winner, Loser, Set Score, Date (Optional)
+                # Expected format: 22/8/2025 00:00:00	Kiran	SrikanthK	2-1	[optional date]
+                
+                # Check if we have the required fields for the new format
+                if 'Timestamp' in record and 'Winner' in record and 'Loser' in record:
+                    # New Google Sheets format
+                    timestamp_str = str(record['Timestamp']).strip()
+                    winner_name = self._normalize_player_name(record['Winner'])
+                    loser_name = self._normalize_player_name(record['Loser'])
+                    
+                    # Handle different score column names: 'Set Score', 'Score', or 'Final Score'
+                    score_str = str(record.get('Set Score', record.get('Score', record.get('Final Score', '')))).strip()
+                    
+                    # Check for optional Date column - prioritize this over timestamp
+                    optional_date_str = str(record.get('Date (Optional - if played today)', '')).strip()
+                    
+                    # Determine the actual match date
+                    if optional_date_str and optional_date_str.lower() not in ['', 'nan', 'none']:
+                        # Use the optional date if present (MM/DD/YYYY format)
+                        try:
+                            # Optional date column uses MM/DD/YYYY format (e.g., 9/8/2025, 8/25/2025)
+                            match_date = datetime.strptime(optional_date_str, '%m/%d/%Y')
+                            logging.info(f"Using optional date '{optional_date_str}' (MM/DD/YYYY format)")
+                        except ValueError:
+                            # If optional date parsing fails, fall back to timestamp
+                            logging.warning(f"Could not parse optional date '{optional_date_str}' as MM/DD/YYYY, using timestamp instead")
+                            try:
+                                # Timestamp uses DD/MM/YYYY HH:MM:SS format (e.g., 22/8/2025 00:00:00)
+                                match_date = datetime.strptime(timestamp_str, '%d/%m/%Y %H:%M:%S')
+                            except ValueError:
+                                # Try alternative format without time
+                                match_date = datetime.strptime(timestamp_str.split(' ')[0], '%d/%m/%Y')
+                    else:
+                        # Use timestamp if no optional date provided (DD/MM/YYYY format)
+                        try:
+                            # Timestamp uses DD/MM/YYYY HH:MM:SS format (e.g., 22/8/2025 00:00:00)
+                            match_date = datetime.strptime(timestamp_str, '%d/%m/%Y %H:%M:%S')
+                        except ValueError:
+                            # Try alternative format without time
+                            match_date = datetime.strptime(timestamp_str.split(' ')[0], '%d/%m/%Y')
+                    
+                    # Parse the score (format: 2-1)
+                    scores = list(map(int, score_str.split('-')))
+                    
+                # Note: Legacy format support removed - only Google Sheets format supported
+                else:
+                    # Skip records that don't match either format
+                    continue
                 
                 # Skip records with unknown or identical players
-                if 'Unknown' in [p1_name, p2_name, winner_name] or p1_name == p2_name:
+                if 'Unknown' in [winner_name, loser_name] or winner_name == loser_name:
+                    logging.warning(f"Skipping record with invalid players - Winner: '{winner_name}', Loser: '{loser_name}'. Record: {record}")
                     continue
-
-                loser_name = p2_name if winner_name == p1_name else p1_name
-                scores = list(map(int, record['Final Score'].split('-')))
                 
                 processed_matches.append({
-                    'date': datetime.strptime(record['Date'], '%m/%d/%Y'),
-                    'winner': winner_name, 'loser': loser_name,
-                    'winner_sets': max(scores), 'loser_sets': min(scores)
+                    'date': match_date,
+                    'winner': winner_name, 
+                    'loser': loser_name,
+                    'winner_sets': max(scores), 
+                    'loser_sets': min(scores)
                 })
-            except (ValueError, IndexError):
+                
+            except (ValueError, IndexError, KeyError) as e:
+                logging.warning(f"Skipping invalid record due to parsing error: {record}. Error: {e}")
                 continue
+        
+        # Log details about skipped records
+        total_records = len(match_data)
+        processed_records = len(processed_matches)
+        skipped_records = total_records - processed_records
+        if skipped_records > 0:
+            logging.info(f"Skipped {skipped_records} records out of {total_records} total records")
+                
         return sorted(processed_matches, key=lambda x: x['date'])
 
     def _update_elo(self, winner_elo, loser_elo):
@@ -213,24 +282,42 @@ class PlayerRankingSystem:
         today = datetime.now()
         weekly_rankings = {}
         
-        # Create a raw list of all historical matches to pass to the temp system
+        # Create a raw list of all historical matches in Google Sheets format
         raw_historical_data = [
-            {'Date': m['date'].strftime('%m/%d/%Y'), 'Player 1': m['winner'], 'Player 2': m['loser'], 'Winner': m['winner'], 'Final Score': '1-0'} 
+            {
+                'Timestamp': m['date'].strftime('%d/%m/%Y %H:%M:%S'), 
+                'Winner': m['winner'], 
+                'Loser': m['loser'], 
+                'Final Score': f"{m['winner_sets']}-{m['loser_sets']}"
+            } 
             for m in self.match_history
         ]
-        temp_ranking_system_all = PlayerRankingSystem(raw_historical_data)
-        all_players = list(temp_ranking_system_all.players.keys())
+        
+        # Get all players from the current system
+        all_players = list(self.players.keys())
 
         for i in range(num_weeks - 1, -1, -1):
             end_of_week = today - timedelta(weeks=i)
             end_of_week = (end_of_week - timedelta(days=end_of_week.weekday()) + timedelta(days=6)).replace(hour=23, minute=59, second=59)
             
-            raw_match_subset = [
-                m for m in raw_historical_data if datetime.strptime(m['Date'], '%m/%d/%Y') <= end_of_week
-            ]
-
-            if not raw_match_subset: continue
+            # Filter matches up to end of this week
+            matches_up_to_week = [m for m in self.match_history if m['date'] <= end_of_week]
             
+            if not matches_up_to_week: 
+                continue
+            
+            # Create raw data for this week in Google Sheets format
+            raw_match_subset = [
+                {
+                    'Timestamp': m['date'].strftime('%d/%m/%Y %H:%M:%S'), 
+                    'Winner': m['winner'], 
+                    'Loser': m['loser'], 
+                    'Final Score': f"{m['winner_sets']}-{m['loser_sets']}"
+                } 
+                for m in matches_up_to_week
+            ]
+            
+            # Create temporary ranking system for this week
             temp_ranking_system = PlayerRankingSystem(raw_match_subset)
             players_elo = {p: d['elo'] for p, d in temp_ranking_system.players.items()}
             sorted_players = sorted(players_elo.items(), key=lambda item: item[1], reverse=True)
@@ -401,7 +488,7 @@ class PlayerRankingSystem:
                     ax.text(j + 0.5, i + 0.5, display_text, ha='center', va='center', 
                            fontsize=7, weight='bold', color=text_color)
         
-        ax.set_title(f'🎯 {period_title} Head-to-Head Results (W-L Format)', fontsize=16, weight='bold', pad=20)
+        ax.set_title(f'{period_title} Head-to-Head Results (W-L Format)', fontsize=16, weight='bold', pad=20)
         ax.set_xlabel('Opponent (Column)', fontsize=12)
         ax.set_ylabel('Player (Row)', fontsize=12)
         
@@ -443,88 +530,214 @@ class PlayerRankingSystem:
         plt.close(fig)
         return buf
 
-# --- Functions for AppSheet and Telegram ---
-def get_appsheet_data():
-    """Fetches all rows from the specified AppSheet table via API."""
-    if not all([APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, APPSHEET_TABLE_NAME]):
-        logging.error("AppSheet environment variables (APP_ID, ACCESS_KEY, TABLE_NAME) are not set. Cannot fetch data.")
+# --- Functions for Google Sheets and Telegram ---
+def get_google_sheets_data(max_retries=5):
+    """Fetches all rows from the specified Google Sheets document with robust error handling."""
+    if not GOOGLE_SERVICE_ACCOUNT_FILE:
+        logging.error("GOOGLE_SERVICE_ACCOUNT_FILE environment variable is not set. Cannot fetch data.")
         return None
 
-    url = f"https://api.appsheet.com/api/v2/apps/{APPSHEET_APP_ID}/tables/{APPSHEET_TABLE_NAME}/Action"
-    headers = {"ApplicationAccessKey": APPSHEET_ACCESS_KEY, "Content-Type": "application/json"}
-    payload = {"Action": "Find", "Properties": {}, "Rows": []}
+    # Configure SSL context for better compatibility
+    import ssl
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
     
-    try:
-        logging.info("Attempting to fetch data from AppSheet API...")
-        response = requests.post(url, headers=headers, json=payload, timeout=20)
-        response.raise_for_status()
-        logging.info("Successfully fetched data from AppSheet.")
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching data from AppSheet: {e}")
-        return None
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"Attempting to fetch data from Google Sheets (attempt {attempt + 1}/{max_retries})...")
+            
+            # Define the scope for Google Sheets API
+            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+            
+            # Authenticate using service account with custom session
+            creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scope)
+            
+            # Create a custom session with SSL configuration
+            session = requests.Session()
+            session.verify = False  # Disable SSL verification temporarily
+            
+            # Configure retry strategy for the session
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "POST"]
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            
+            # Disable SSL warnings
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            
+            # Authorize with custom session
+            client = gspread.authorize(creds)
+            
+            # Open the spreadsheet and worksheet
+            sheet = client.open_by_key(GOOGLE_SHEETS_ID)
+            worksheet = sheet.worksheet(GOOGLE_SHEET_NAME)
+            
+            # Get all records as list of dictionaries
+            records = worksheet.get_all_records()
+            
+            logging.info(f"Successfully fetched {len(records)} records from Google Sheets.")
+            
+            # Debug: Log first few records to understand the data format
+            if records:
+                logging.info(f"Sample record: {records[0]}")
+                logging.info(f"Available columns: {list(records[0].keys())}")
+            
+            return records
+            
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, ssl.SSLError) as e:
+            logging.warning(f"SSL/Connection error on attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 10)  # Cap wait time at 10 seconds
+                logging.info(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+                continue
+        except Exception as e:
+            logging.error(f"Error fetching data from Google Sheets on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 10)
+                logging.info(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logging.error(f"Failed to fetch Google Sheets data after {max_retries} attempts")
+                break
+    
+    return None
 
-def send_telegram_message(message_text, chat_id=TELEGRAM_CHAT_ID):
-    """Sends a text message to the Telegram group."""
+def create_robust_session():
+    """Creates a requests session with retry strategy and SSL error handling."""
+    session = requests.Session()
+    
+    # Disable SSL warnings for problematic connections
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    # Define retry strategy
+    retry_strategy = Retry(
+        total=5,  # Total number of retries
+        backoff_factor=2,  # Wait time between retries (exponential backoff)
+        status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry
+        allowed_methods=["HEAD", "GET", "POST"],  # HTTP methods to retry
+    )
+    
+    # Mount adapter with retry strategy
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
+
+def send_telegram_message(message_text, chat_id=TELEGRAM_CHAT_ID, max_retries=3):
+    """Sends a text message to the Telegram group with robust error handling."""
     if not all([TELEGRAM_BOT_TOKEN, chat_id]):
         logging.warning("Telegram credentials not set. Printing message to console instead.")
         print(f"--- MOCK TELEGRAM MESSAGE ---\n{message_text}\n---------------------------")
         return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': chat_id, 'text': message_text, 'parse_mode': 'Markdown'}
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        logging.info("Telegram text message sent successfully.")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error sending Telegram text message: {e}")
+    
+    session = create_robust_session()
+    
+    for attempt in range(max_retries):
+        try:
+            response = session.post(url, json=payload, timeout=30)
+            response.raise_for_status()
+            logging.info("Telegram text message sent successfully.")
+            return
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+            logging.warning(f"SSL/Connection error on attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error sending Telegram text message on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+        except Exception as e:
+            logging.error(f"Unexpected error sending Telegram message: {e}")
+            break
+    
+    logging.error(f"Failed to send Telegram message after {max_retries} attempts")
 
-def send_telegram_photo(image_buffer, caption, chat_id=TELEGRAM_CHAT_ID):
-    """Sends an image with a caption to the Telegram group."""
+def send_telegram_photo(image_buffer, caption, chat_id=TELEGRAM_CHAT_ID, max_retries=3):
+    """Sends an image with a caption to the Telegram group with robust error handling."""
     if not all([TELEGRAM_BOT_TOKEN, chat_id]):
         logging.warning("Telegram credentials not set. Printing photo caption to console instead.")
         print(f"--- MOCK TELEGRAM PHOTO ---\nCaption: {caption}\n(Image buffer not displayed)\n-------------------------")
         return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {'photo': ('report_image.png', image_buffer, 'image/png')}
     payload = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
-    try:
-        response = requests.post(url, files=files, data=payload)
-        response.raise_for_status()
-        logging.info(f"Telegram photo sent: {caption}")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error sending Telegram photo: {e}")
+    
+    session = create_robust_session()
+    
+    for attempt in range(max_retries):
+        try:
+            # Reset buffer position for retry attempts
+            image_buffer.seek(0)
+            response = session.post(url, files=files, data=payload, timeout=60)
+            response.raise_for_status()
+            logging.info(f"Telegram photo sent: {caption}")
+            return
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+            logging.warning(f"SSL/Connection error on attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error sending Telegram photo on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+        except Exception as e:
+            logging.error(f"Unexpected error sending Telegram photo: {e}")
+            break
+    
+    logging.error(f"Failed to send Telegram photo after {max_retries} attempts")
 
 def get_metrics_explanation():
     """Returns a formatted string explaining the leaderboard metrics."""
     return (
-        "📊 *Understanding the Leaderboard Metrics*\n\n"
-        "Here's a quick guide to the terms you'll see in the charts:\n\n"
+        "📊 *Understanding the Leaderboard Reports*\n\n"
+        "Here's how to read the upcoming charts in order:\n\n"
+        "📈 *Report Flow*:\n"
+        "   1️⃣ **Weekly Leaderboard** (if matches this week)\n"
+        "   2️⃣ **Weekly Head-to-Head Matrix** (if matches this week)\n"
+        "   3️⃣ **Monthly Leaderboard** (if matches this month)\n"
+        "   4️⃣ **Monthly Head-to-Head Matrix** (if matches this month)\n"
+        "   5️⃣ **Last Month's Final Standings** (first week of new month only)\n"
+        "   6️⃣ **Ranking Progression Trends** (5-week ranking changes)\n"
+        "   7️⃣ **All-Time Head-to-Head Overview** (complete historical matrix)\n\n"
+        "🏆 *Leaderboard Columns*:\n"
+        "   • **Elo**: Long-term skill rating based on entire match history\n"
+        "   • **Score**: Period performance = Elo + Win Bonus + Set Difference Bonus\n"
+        "   • **Set Diff**: Sets won minus sets lost in the current period\n\n"
         "🎯 *Head-to-Head Matrix (W-L Format)*:\n"
-        "   - Shows records between every pair of players for different time periods\n"
-        "   - Format: 'Wins-Losses' (e.g., '3-1' = 3 wins, 1 loss against that opponent)\n"
-        "   - White = no matches played, Light Yellow = struggling, Light Blue = competitive, Dark Blue = dominating\n"
-        "   - Find your name on the left (row), look across to see your record vs each opponent\n\n"
-        "1️⃣. *Elo*:\n"
-        "   - This is your long-term *skill rating* based on your entire match history.\n"
-        "   - It goes up when you win and down when you lose.\n"
-        "   - Beating a higher-rated player gives you more points.\n\n"
-        "2️⃣. *Score*:\n"
-        "   - This is your performance score *for the current period* (e.g., this week).\n"
-        "   - It's calculated as: `Elo + (Wins Bonus) + (Set Difference Bonus)`.\n"
-        "   - This formula rewards both high skill and strong recent performance.\n\n"
-        "3️⃣. *Set Diff*:\n"
-        "   - The total number of sets you've won minus the sets you've lost in the period.\n"
-        "   - A higher number means you are winning your matches decisively."
+        "   • Format: 'Wins-Losses' (e.g., '3-1' = 3 wins, 1 loss vs that opponent)\n"
+        "   • Colors: White = no games, Light Yellow = struggling, Dark Blue = dominating\n"
+        "   • Find your name on the left (row), look across for your record vs each opponent\n\n"
+        "📊 *Smart Reporting*:\n"
+        "   • Weekly/monthly charts only appear when matches exist in those periods\n"
+        "   • Ranking progression shows who's climbing or falling over 5 weeks\n"
+        "   • All-time matrix always shows complete head-to-head history\n"
+        "   • Individual player charts are disabled for cleaner reports"
     )
 
 def main():
     """Main function to run the report generation process."""
     logging.info("Starting the report generation process...")
 
-    data = get_appsheet_data()
+    data = get_google_sheets_data()
     if not data:
-        logging.warning("No data fetched from AppSheet. Aborting process.")
+        logging.warning("No data fetched from Google Sheets. Aborting process.")
         send_telegram_message("Could not fetch match data. The leaderboard could not be updated. Please check the data source.")
         return
 
@@ -532,29 +745,17 @@ def main():
     
     send_telegram_message(get_metrics_explanation())
 
-    # --- Comprehensive Performance Matrices for Different Periods ---
-    
-    # All-time comprehensive matrix
-    comprehensive_chart_all = ranking_system.generate_comprehensive_performance_matrix('all_time')
-    if comprehensive_chart_all:
-        send_telegram_photo(comprehensive_chart_all, caption="🎯 *All-Time Head-to-Head Overview*: Complete historical record between all players. Format: 'Wins-Losses' (e.g., '3-1' = 3 wins, 1 loss). Color intensity shows dominance level.")
-    
-    # Weekly comprehensive matrix (if there are weekly matches)
-    comprehensive_chart_weekly = ranking_system.generate_comprehensive_performance_matrix('weekly')
-    if comprehensive_chart_weekly:
-        send_telegram_photo(comprehensive_chart_weekly, caption="📅 *This Week's Head-to-Head*: Shows only matches from this week. Format: 'Wins-Losses'. Great for seeing current week dynamics!")
-    
-    # Monthly comprehensive matrix (if there are monthly matches)
-    comprehensive_chart_monthly = ranking_system.generate_comprehensive_performance_matrix('monthly')
-    if comprehensive_chart_monthly:
-        send_telegram_photo(comprehensive_chart_monthly, caption="🗓️ *This Month's Head-to-Head*: Shows only matches from this month. Format: 'Wins-Losses'. Track monthly rivalries!")
-
     # --- Weekly Leaderboard ---
     weekly_lb, weekly_name = ranking_system.generate_leaderboard('weekly')
     if isinstance(weekly_lb, pd.DataFrame) and not weekly_lb.empty:
         weekly_img = ranking_system.generate_leaderboard_image(weekly_lb, weekly_name)
         if weekly_img:
-            send_telegram_photo(weekly_img, caption=f"🏆 Here is *{weekly_name} Leaderboard*! See the legend above for details.")
+            send_telegram_photo(weekly_img, caption=f"� Here is *{weekly_name} Leaderboard*! See the legend above for details.")
+        
+        # Weekly comprehensive matrix (if there are weekly matches)
+        comprehensive_chart_weekly = ranking_system.generate_comprehensive_performance_matrix('weekly')
+        if comprehensive_chart_weekly:
+            send_telegram_photo(comprehensive_chart_weekly, caption="📅 *This Week's Head-to-Head*: Shows only matches from this week. Format: 'Wins-Losses'. Great for seeing current week dynamics!")
     else:
         send_telegram_message(f"No matches played this week yet. Let's get some games in!")
 
@@ -564,6 +765,11 @@ def main():
         monthly_img = ranking_system.generate_leaderboard_image(monthly_lb, monthly_name)
         if monthly_img:
             send_telegram_photo(monthly_img, caption=f"🗓️ And here is the progress for the *{monthly_name} Leaderboard*!")
+        
+        # Monthly comprehensive matrix (if there are monthly matches)
+        comprehensive_chart_monthly = ranking_system.generate_comprehensive_performance_matrix('monthly')
+        if comprehensive_chart_monthly:
+            send_telegram_photo(comprehensive_chart_monthly, caption="🗓️ *This Month's Head-to-Head*: Shows only matches from this month. Format: 'Wins-Losses'. Track monthly rivalries!")
     else:
         send_telegram_message(f"No matches played this month yet.")
 
@@ -575,7 +781,7 @@ def main():
             if last_month_img:
                 send_telegram_photo(last_month_img, caption=f" retrospection: Here are the final standings for the *{last_month_name} Leaderboard*!")
             
-    # --- Trend Charts and Individual Stats ---
+    # --- Ranking Progression Trends ---
     active_players = ranking_system.get_active_players(period_days=35)
     if active_players:
         weekly_rankings_df = ranking_system.get_weekly_rankings(num_weeks=5)
@@ -583,11 +789,19 @@ def main():
         if progression_chart:
             send_telegram_photo(progression_chart, caption="📈 *Ranking Trends*: Check out who's climbing the ranks over the last 5 weeks!")
 
-        send_telegram_message("\n--- *Individual Head-to-Head Stats* ---\n(Shows your total wins against each opponent)")
-        for player in sorted(list(active_players)):
-            h2h_chart = ranking_system.generate_head_to_head_chart(player)
-            if h2h_chart:
-                send_telegram_photo(h2h_chart, caption=f"Win stats for *{player}*")
+    # --- Comprehensive Performance Matrices (All-Time Overview) ---
+    # All-time comprehensive matrix - placed at the end for complete historical overview
+    comprehensive_chart_all = ranking_system.generate_comprehensive_performance_matrix('all_time')
+    if comprehensive_chart_all:
+        send_telegram_photo(comprehensive_chart_all, caption="🎯 *All-Time Head-to-Head Overview*: Complete historical record between all players. Format: 'Wins-Losses' (e.g., '3-1' = 3 wins, 1 loss). Color intensity shows dominance level.")
+
+    # --- Individual Head-to-Head Stats (COMMENTED OUT) ---
+    # if active_players:
+    #     send_telegram_message("\n--- *Individual Head-to-Head Stats* ---\n(Shows your total wins against each opponent)")
+    #     for player in sorted(list(active_players)):
+    #         h2h_chart = ranking_system.generate_head_to_head_chart(player)
+    #         if h2h_chart:
+    #             send_telegram_photo(h2h_chart, caption=f"Win stats for *{player}*")
 
     logging.info("Report generation process finished.")
 

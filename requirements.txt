@@ -1,4 +1,7 @@
 pandas
 requests
 matplotlib
-seaborn 
+seaborn
+gspread
+google-auth
+python-dotenv

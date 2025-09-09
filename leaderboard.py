@@ -91,11 +91,12 @@ class PlayerRankingSystem:
                 # Expected format: 22/8/2025 00:00:00	Kiran	SrikanthK	2-1	[optional date]
                 
                 # Check if we have the required fields for the new format
-                if 'Timestamp' in record and 'Winner' in record and 'Loser' in record:
+                if 'Timestamp' in record and 'Winner' in record and ('Loser' in record or 'Runner up' in record):
                     # New Google Sheets format
                     timestamp_str = str(record['Timestamp']).strip()
                     winner_name = self._normalize_player_name(record['Winner'])
-                    loser_name = self._normalize_player_name(record['Loser'])
+                    # Handle both 'Loser' and 'Runner up' column names
+                    loser_name = self._normalize_player_name(record.get('Loser', record.get('Runner up', '')))
                     
                     # Handle different score column names: 'Set Score', 'Score', or 'Final Score'
                     score_str = str(record.get('Set Score', record.get('Score', record.get('Final Score', '')))).strip()

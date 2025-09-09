@@ -25,22 +25,24 @@ This project provides a Python script to generate and display a comprehensive ta
 Your Google Sheets document should have the following columns:
 - **Timestamp**: Date and time in format `22/8/2025 00:00:00` (DD/MM/YYYY HH:MM:SS)
 - **Winner**: Name of the winning player
-- **Loser**: Name of the losing player  
+- **Runner up**: Name of the losing player (also supports "Loser" for backward compatibility)
 - **Set Score**: Match score in format `2-1` (winner sets - loser sets)
-- **Date (Optional - if played today)**: Override date in various formats (MM/DD/YYYY, DD/MM/YYYY, etc.)
+- **Date (Optional - if played today)**: Override date in MM/DD/YYYY format (Month/Day/Year)
 
 Example data:
 ```
-Timestamp               Winner      Loser       Set Score   Date (Optional - if played today)
+Timestamp               Winner      Runner up   Set Score   Date (Optional - if played today)
 22/8/2025 00:00:00     Kiran       SrikanthK   2-1         
 9/8/2025 19:41:50      Pavan       Kiran       2-0         
 9/8/2025 21:42:43      Pavan       Kiran       2-1         9/8/2025
 9/8/2025 21:44:09      Pavan       Kiran       2-0         8/25/2025
 ```
 
-**Date Logic**: 
+**Date Format Logic**: 
+- **Timestamp column**: Uses DD/MM/YYYY HH:MM:SS format (Day/Month/Year with time)
+- **Optional Date column**: Uses MM/DD/YYYY format (Month/Day/Year)
 - If the optional Date column has a value, that date is used for the match
-- If the optional Date column is empty, the Timestamp is used
+- If the optional Date column is empty, the Timestamp date is used
 - This allows for backdating matches or correcting dates when needed
 
 ## Setup Instructions

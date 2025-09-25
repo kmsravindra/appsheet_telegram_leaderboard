@@ -56,13 +56,9 @@ class PlayerRankingSystem:
         """Parse date from timestamp string, handling multiple date formats flexibly."""
         # Handle various timestamp formats found in the data
         
-        # List of possible timestamp formats to try (most specific first)
+        # List of possible timestamp formats to try (DD/MM/YYYY format only for timestamp column)
         timestamp_formats = [
-            '%m/%d/%Y %H:%M:%S',  # MM/DD/YYYY HH:MM:SS (e.g., 9/16/2025 10:29:21)
             '%d/%m/%Y %H:%M:%S',  # DD/MM/YYYY HH:MM:SS (e.g., 22/8/2025 00:00:00)
-            '%m/%d/%Y %H:%M:%S',  # M/D/YYYY H:MM:SS (e.g., 9/8/2025 0:00:00)
-            '%d/%m/%Y %H:%M:%S',  # D/M/YYYY H:MM:SS (e.g., 7/9/2025 0:00:00)
-            '%m/%d/%Y',           # MM/DD/YYYY (e.g., 9/16/2025)
             '%d/%m/%Y',           # DD/MM/YYYY (e.g., 22/8/2025)
         ]
         

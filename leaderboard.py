@@ -33,59 +33,92 @@ class PlayerRankingSystem:
         self.k_factor = k_factor
         self.players = {}
 
-        # This map standardizes player names to prevent splitting a player's record.
-        # It maps a normalized key (lowercase, no spaces) to a single official name.
-        self.player_alias_map = {
-            # Official Name: SrikanthK
-            'srikanthk': 'SrikanthK',   # Catches "SrikanthK"
-            'srikanth k': 'SrikanthK',   # Catches "Srikanth K"
-            
-            # Official Name: SrikanthV (This is a distinct player)
-            'srikanthv': 'SrikanthV',
-            
-            # Official Name: Ravi Gupta (Distinct player)
-            'ravigupta': 'Ravi Gupta',
-            
-            # Official Name: Ravi L (Distinct player)
-            'ravil': 'Ravi L',
-            
-            # Official Name: Jayasankar
-            'jayasankar': 'Jayasankar', # Catches "Jayasankar"
-            'jayashankar': 'Jayasankar',# Catches "Jayashankar"
-            'jayashankar': 'Jayasankar',# Catches "Jaya shankar" (normalizes to the same key)
 
-            # Official Name: Sridhar
-            'sridhar': 'Sridhar',     # Catches "Sridhar"
-            'sreedhar': 'Sridhar',    # Catches "Sreedhar" and maps it to "Sridhar"            
-            # Add other potential aliases here as you discover them
-        }
-
+        logging.info(f"Total lines read from sheet: {len(match_data)}")
+        
         self.match_history = self._preprocess_data(match_data)
         
-        # Debug: Log match processing results
-        logging.info(f"Processed {len(self.match_history)} matches from {len(match_data)} records")
-        if self.match_history:
-            logging.info(f"Date range: {self.match_history[0]['date']} to {self.match_history[-1]['date']}")
-            logging.info(f"Sample processed match: {self.match_history[0]}")
+        logging.info(f"Total processed: {len(self.match_history)} matches")
         
         self._calculate_elo_ratings()
+        self._log_player_statistics()
 
     def _normalize_player_name(self, name):
-        # This function uses the alias map for robust name standardization.
+        # Since all data is now in CamelCase format, just use the names directly
         if not isinstance(name, str):
             return "Unknown" # Handle potential non-string data
         
-        # Standardize by removing spaces and converting to lowercase to create a lookup key
-        normalized_key = name.strip().replace(" ", "").lower()
+        # Simply return the name as-is after stripping whitespace
+        # This preserves the exact CamelCase format from the spreadsheet
+        return name.strip()
+
+    def _parse_flexible_date(self, timestamp_str):
+        """Parse date from timestamp string, handling multiple date formats flexibly."""
+        # Handle various timestamp formats found in the data
         
-        # Return the official name from the map; otherwise, format the original name cleanly.
-        return self.player_alias_map.get(normalized_key, name.strip().title())
+        # List of possible timestamp formats to try (most specific first)
+        timestamp_formats = [
+            '%m/%d/%Y %H:%M:%S',  # MM/DD/YYYY HH:MM:SS (e.g., 9/16/2025 10:29:21)
+            '%d/%m/%Y %H:%M:%S',  # DD/MM/YYYY HH:MM:SS (e.g., 22/8/2025 00:00:00)
+            '%m/%d/%Y %H:%M:%S',  # M/D/YYYY H:MM:SS (e.g., 9/8/2025 0:00:00)
+            '%d/%m/%Y %H:%M:%S',  # D/M/YYYY H:MM:SS (e.g., 7/9/2025 0:00:00)
+            '%m/%d/%Y',           # MM/DD/YYYY (e.g., 9/16/2025)
+            '%d/%m/%Y',           # DD/MM/YYYY (e.g., 22/8/2025)
+        ]
+        
+        for date_format in timestamp_formats:
+            try:
+                if ' ' in timestamp_str and ' ' not in date_format:
+                    # Try parsing just the date part if format doesn't include time
+                    date_part = timestamp_str.split(' ')[0]
+                    return datetime.strptime(date_part, date_format)
+                else:
+                    return datetime.strptime(timestamp_str, date_format)
+            except ValueError:
+                continue
+        
+        # If all formats fail, try a more flexible approach
+        # Handle cases where day/month might be ambiguous
+        try:
+            # Split the timestamp to get date and time parts
+            parts = timestamp_str.split(' ')
+            date_part = parts[0]
+            
+            # Split date by '/'
+            date_components = date_part.split('/')
+            if len(date_components) == 3:
+                part1, part2, year = date_components
+                
+                # Try both interpretations: MM/DD and DD/MM
+                for month, day in [(part1, part2), (part2, part1)]:
+                    try:
+                        # Validate day and month ranges
+                        day_int, month_int = int(day), int(month)
+                        if 1 <= day_int <= 31 and 1 <= month_int <= 12:
+                            # Create datetime object
+                            if len(parts) > 1:
+                                time_part = parts[1]
+                                time_components = time_part.split(':')
+                                hour = int(time_components[0]) if len(time_components) > 0 else 0
+                                minute = int(time_components[1]) if len(time_components) > 1 else 0
+                                second = int(time_components[2]) if len(time_components) > 2 else 0
+                                return datetime(int(year), month_int, day_int, hour, minute, second)
+                            else:
+                                return datetime(int(year), month_int, day_int)
+                    except (ValueError, TypeError):
+                        continue
+        except (ValueError, IndexError):
+            pass
+        
+        # If all formats fail, raise an error with details
+        raise ValueError(f"Could not parse timestamp '{timestamp_str}' with any known format")
 
     def _preprocess_data(self, match_data):
         processed_matches = []
         if not match_data:
             return processed_matches
-        for record in match_data:
+        
+        for record_idx, record in enumerate(match_data):
             try:
                 # Handle the new Google Sheets format: Timestamp, Winner, Loser, Set Score, Date (Optional)
                 # Expected format: 22/8/2025 00:00:00	Kiran	SrikanthK	2-1	[optional date]
@@ -94,9 +127,11 @@ class PlayerRankingSystem:
                 if 'Timestamp' in record and 'Winner' in record and ('Loser' in record or 'Runner up' in record):
                     # New Google Sheets format
                     timestamp_str = str(record['Timestamp']).strip()
-                    winner_name = self._normalize_player_name(record['Winner'])
-                    # Handle both 'Loser' and 'Runner up' column names
-                    loser_name = self._normalize_player_name(record.get('Loser', record.get('Runner up', '')))
+                    raw_winner = record['Winner']
+                    raw_loser = record.get('Loser', record.get('Runner up', ''))
+                    
+                    winner_name = self._normalize_player_name(raw_winner)
+                    loser_name = self._normalize_player_name(raw_loser)
                     
                     # Handle different score column names: 'Set Score', 'Score', or 'Final Score'
                     score_str = str(record.get('Set Score', record.get('Score', record.get('Final Score', '')))).strip()
@@ -110,36 +145,22 @@ class PlayerRankingSystem:
                         try:
                             # Optional date column uses MM/DD/YYYY format (e.g., 9/8/2025, 8/25/2025)
                             match_date = datetime.strptime(optional_date_str, '%m/%d/%Y')
-                            logging.info(f"Using optional date '{optional_date_str}' (MM/DD/YYYY format)")
                         except ValueError:
                             # If optional date parsing fails, fall back to timestamp
-                            logging.warning(f"Could not parse optional date '{optional_date_str}' as MM/DD/YYYY, using timestamp instead")
-                            try:
-                                # Timestamp uses DD/MM/YYYY HH:MM:SS format (e.g., 22/8/2025 00:00:00)
-                                match_date = datetime.strptime(timestamp_str, '%d/%m/%Y %H:%M:%S')
-                            except ValueError:
-                                # Try alternative format without time
-                                match_date = datetime.strptime(timestamp_str.split(' ')[0], '%d/%m/%Y')
+                            match_date = self._parse_flexible_date(timestamp_str)
                     else:
-                        # Use timestamp if no optional date provided (DD/MM/YYYY format)
-                        try:
-                            # Timestamp uses DD/MM/YYYY HH:MM:SS format (e.g., 22/8/2025 00:00:00)
-                            match_date = datetime.strptime(timestamp_str, '%d/%m/%Y %H:%M:%S')
-                        except ValueError:
-                            # Try alternative format without time
-                            match_date = datetime.strptime(timestamp_str.split(' ')[0], '%d/%m/%Y')
+                        # Use timestamp if no optional date provided - try multiple formats
+                        match_date = self._parse_flexible_date(timestamp_str)
                     
                     # Parse the score (format: 2-1)
                     scores = list(map(int, score_str.split('-')))
                     
                 # Note: Legacy format support removed - only Google Sheets format supported
                 else:
-                    # Skip records that don't match either format
                     continue
                 
                 # Skip records with unknown or identical players
-                if 'Unknown' in [winner_name, loser_name] or winner_name == loser_name:
-                    logging.warning(f"Skipping record with invalid players - Winner: '{winner_name}', Loser: '{loser_name}'. Record: {record}")
+                if 'Unknown' in [winner_name, loser_name] or winner_name == loser_name or not winner_name or not loser_name:
                     continue
                 
                 processed_matches.append({
@@ -151,16 +172,8 @@ class PlayerRankingSystem:
                 })
                 
             except (ValueError, IndexError, KeyError) as e:
-                logging.warning(f"Skipping invalid record due to parsing error: {record}. Error: {e}")
                 continue
         
-        # Log details about skipped records
-        total_records = len(match_data)
-        processed_records = len(processed_matches)
-        skipped_records = total_records - processed_records
-        if skipped_records > 0:
-            logging.info(f"Skipped {skipped_records} records out of {total_records} total records")
-                
         return sorted(processed_matches, key=lambda x: x['date'])
 
     def _update_elo(self, winner_elo, loser_elo):
@@ -180,6 +193,34 @@ class PlayerRankingSystem:
             new_winner_elo, new_loser_elo = self._update_elo(winner_current_elo, loser_current_elo)
             self.players[winner_name]['elo'] = new_winner_elo
             self.players[loser_name]['elo'] = new_loser_elo
+
+    def _log_player_statistics(self):
+        """Log simple statistics for each player: PersonName, TotalMatches, TotalWins, TotalLoses."""
+        # Calculate statistics for each player
+        player_stats = {}
+        for player in self.players.keys():
+            player_stats[player] = {
+                'total_matches': 0,
+                'total_wins': 0,
+                'total_losses': 0
+            }
+        
+        # Process all matches to gather statistics
+        for match in self.match_history:
+            winner = match['winner']
+            loser = match['loser']
+            
+            # Update winner stats
+            player_stats[winner]['total_matches'] += 1
+            player_stats[winner]['total_wins'] += 1
+            
+            # Update loser stats
+            player_stats[loser]['total_matches'] += 1
+            player_stats[loser]['total_losses'] += 1
+        
+        # Log simple statistics for each player
+        for player, stats in sorted(player_stats.items()):
+            logging.info(f"{player}: TotalMatches={stats['total_matches']}, TotalWins={stats['total_wins']}, TotalLoses={stats['total_losses']}")
 
     def get_active_players(self, period_days=35):
         """Get a set of players who have been active in the last `period_days`."""
@@ -206,11 +247,17 @@ class PlayerRankingSystem:
             end_date = first_day_of_current_month - timedelta(days=1)
             start_date = end_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             period_name = f"{start_date.strftime('%B %Y')}"
+        elif period == 'all_time':
+            # Use all matches for all-time leaderboard
+            period_matches = self.match_history
+            player_names_in_period = set(m['winner'] for m in period_matches) | set(m['loser'] for m in period_matches)
+            period_name = "All-Time"
         else:
-            raise ValueError("Period must be 'weekly', 'monthly', or 'last_month'")
+            raise ValueError("Period must be 'weekly', 'monthly', 'last_month', or 'all_time'")
 
-        period_matches = [m for m in self.match_history if start_date <= m['date'] <= end_date]
-        player_names_in_period = set(m['winner'] for m in period_matches) | set(m['loser'] for m in period_matches)
+        if period != 'all_time':
+            period_matches = [m for m in self.match_history if start_date <= m['date'] <= end_date]
+            player_names_in_period = set(m['winner'] for m in period_matches) | set(m['loser'] for m in period_matches)
         
         if not player_names_in_period:
             return f"No matches played for the period: {period_name.lower()}.", period_name
@@ -318,8 +365,13 @@ class PlayerRankingSystem:
                 for m in matches_up_to_week
             ]
             
-            # Create temporary ranking system for this week
-            temp_ranking_system = PlayerRankingSystem(raw_match_subset)
+            # Create temporary ranking system for this week (without logging)
+            temp_ranking_system = PlayerRankingSystem.__new__(PlayerRankingSystem)
+            temp_ranking_system.default_elo = self.default_elo
+            temp_ranking_system.k_factor = self.k_factor
+            temp_ranking_system.players = {}
+            temp_ranking_system.match_history = temp_ranking_system._preprocess_data(raw_match_subset)
+            temp_ranking_system._calculate_elo_ratings()
             players_elo = {p: d['elo'] for p, d in temp_ranking_system.players.items()}
             sorted_players = sorted(players_elo.items(), key=lambda item: item[1], reverse=True)
             
@@ -716,7 +768,8 @@ def get_metrics_explanation():
         "   4️⃣ **Monthly Head-to-Head Matrix** (if matches this month)\n"
         "   5️⃣ **Last Month's Final Standings** (first week of new month only)\n"
         "   6️⃣ **Ranking Progression Trends** (5-week ranking changes)\n"
-        "   7️⃣ **All-Time Head-to-Head Overview** (complete historical matrix)\n\n"
+        "   7️⃣ **All-Time Leaderboard** (overall performance across all matches)\n"
+        "   8️⃣ **All-Time Head-to-Head Overview** (complete historical matrix)\n\n"
         "🏆 *Leaderboard Columns*:\n"
         "   • **Elo**: Long-term skill rating based on entire match history\n"
         "   • **Score**: Period performance = Elo + Win Bonus + Set Difference Bonus\n"
@@ -789,6 +842,13 @@ def main():
         progression_chart = ranking_system.generate_ranking_progression_chart(active_players, weekly_rankings_df)
         if progression_chart:
             send_telegram_photo(progression_chart, caption="📈 *Ranking Trends*: Check out who's climbing the ranks over the last 5 weeks!")
+
+    # --- All-Time Leaderboard ---
+    all_time_lb, all_time_name = ranking_system.generate_leaderboard('all_time')
+    if isinstance(all_time_lb, pd.DataFrame) and not all_time_lb.empty:
+        all_time_img = ranking_system.generate_leaderboard_image(all_time_lb, all_time_name)
+        if all_time_img:
+            send_telegram_photo(all_time_img, caption=f"🏆 Here is the *{all_time_name} Leaderboard*! This shows overall performance across all matches ever played.")
 
     # --- Comprehensive Performance Matrices (All-Time Overview) ---
     # All-time comprehensive matrix - placed at the end for complete historical overview

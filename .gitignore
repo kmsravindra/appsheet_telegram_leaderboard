@@ -4,8 +4,10 @@
 .env.*.local
 
 # Google Service Account credentials
-*.json
 google-service-account.json
+# Allow example files
+!*.example
+!google-service-account.json.example
 
 # Python
 __pycache__/

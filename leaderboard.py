@@ -33,7 +33,6 @@ class PlayerRankingSystem:
         self.k_factor = k_factor
         self.players = {}
 
-
         logging.info(f"Total lines read from sheet: {len(match_data)}")
         
         self.match_history = self._preprocess_data(match_data)
@@ -44,22 +43,22 @@ class PlayerRankingSystem:
         self._log_player_statistics()
 
     def _normalize_player_name(self, name):
-        # Since all data is now in CamelCase format, just use the names directly
+        # Since Google Sheets already has clean unique names, just use them directly
         if not isinstance(name, str):
             return "Unknown" # Handle potential non-string data
         
         # Simply return the name as-is after stripping whitespace
-        # This preserves the exact CamelCase format from the spreadsheet
+        # This preserves the exact format from the Google Sheets
         return name.strip()
 
     def _parse_flexible_date(self, timestamp_str):
-        """Parse date from timestamp string, handling multiple date formats flexibly."""
-        # Handle various timestamp formats found in the data
+        """Parse date from timestamp string, handling MM/DD/YYYY format consistently."""
+        # Handle MM/DD/YYYY timestamp formats found in the data
         
-        # List of possible timestamp formats to try (DD/MM/YYYY format only for timestamp column)
+        # List of possible timestamp formats to try (MM/DD/YYYY format for all columns)
         timestamp_formats = [
-            '%d/%m/%Y %H:%M:%S',  # DD/MM/YYYY HH:MM:SS (e.g., 22/8/2025 00:00:00)
-            '%d/%m/%Y',           # DD/MM/YYYY (e.g., 22/8/2025)
+            '%m/%d/%Y %H:%M:%S',  # MM/DD/YYYY HH:MM:SS (e.g., 9/8/2025 21:54:42)
+            '%m/%d/%Y',           # MM/DD/YYYY (e.g., 9/8/2025)
         ]
         
         for date_format in timestamp_formats:
@@ -73,41 +72,8 @@ class PlayerRankingSystem:
             except ValueError:
                 continue
         
-        # If all formats fail, try a more flexible approach
-        # Handle cases where day/month might be ambiguous
-        try:
-            # Split the timestamp to get date and time parts
-            parts = timestamp_str.split(' ')
-            date_part = parts[0]
-            
-            # Split date by '/'
-            date_components = date_part.split('/')
-            if len(date_components) == 3:
-                part1, part2, year = date_components
-                
-                # Try both interpretations: MM/DD and DD/MM
-                for month, day in [(part1, part2), (part2, part1)]:
-                    try:
-                        # Validate day and month ranges
-                        day_int, month_int = int(day), int(month)
-                        if 1 <= day_int <= 31 and 1 <= month_int <= 12:
-                            # Create datetime object
-                            if len(parts) > 1:
-                                time_part = parts[1]
-                                time_components = time_part.split(':')
-                                hour = int(time_components[0]) if len(time_components) > 0 else 0
-                                minute = int(time_components[1]) if len(time_components) > 1 else 0
-                                second = int(time_components[2]) if len(time_components) > 2 else 0
-                                return datetime(int(year), month_int, day_int, hour, minute, second)
-                            else:
-                                return datetime(int(year), month_int, day_int)
-                    except (ValueError, TypeError):
-                        continue
-        except (ValueError, IndexError):
-            pass
-        
         # If all formats fail, raise an error with details
-        raise ValueError(f"Could not parse timestamp '{timestamp_str}' with any known format")
+        raise ValueError(f"Could not parse timestamp '{timestamp_str}' with MM/DD/YYYY format. Received: '{timestamp_str}'")
 
     def _preprocess_data(self, match_data):
         processed_matches = []
@@ -326,17 +292,6 @@ class PlayerRankingSystem:
         today = datetime.now()
         weekly_rankings = {}
         
-        # Create a raw list of all historical matches in Google Sheets format
-        raw_historical_data = [
-            {
-                'Timestamp': m['date'].strftime('%d/%m/%Y %H:%M:%S'), 
-                'Winner': m['winner'], 
-                'Loser': m['loser'], 
-                'Final Score': f"{m['winner_sets']}-{m['loser_sets']}"
-            } 
-            for m in self.match_history
-        ]
-        
         # Get all players from the current system
         all_players = list(self.players.keys())
 
@@ -344,32 +299,38 @@ class PlayerRankingSystem:
             end_of_week = today - timedelta(weeks=i)
             end_of_week = (end_of_week - timedelta(days=end_of_week.weekday()) + timedelta(days=6)).replace(hour=23, minute=59, second=59)
             
-            # Filter matches up to end of this week
-            matches_up_to_week = [m for m in self.match_history if m['date'] <= end_of_week]
-            
-            if not matches_up_to_week: 
-                continue
-            
-            # Create raw data for this week in Google Sheets format
-            raw_match_subset = [
-                {
-                    'Timestamp': m['date'].strftime('%d/%m/%Y %H:%M:%S'), 
-                    'Winner': m['winner'], 
-                    'Loser': m['loser'], 
-                    'Final Score': f"{m['winner_sets']}-{m['loser_sets']}"
-                } 
-                for m in matches_up_to_week
+            # Filter matches up to end of this week directly from match_history
+            filtered_matches = [
+                m for m in self.match_history if m['date'] <= end_of_week
             ]
             
-            # Create temporary ranking system for this week (without logging)
-            temp_ranking_system = PlayerRankingSystem.__new__(PlayerRankingSystem)
-            temp_ranking_system.default_elo = self.default_elo
-            temp_ranking_system.k_factor = self.k_factor
-            temp_ranking_system.players = {}
-            temp_ranking_system.match_history = temp_ranking_system._preprocess_data(raw_match_subset)
-            temp_ranking_system._calculate_elo_ratings()
-            players_elo = {p: d['elo'] for p, d in temp_ranking_system.players.items()}
-            sorted_players = sorted(players_elo.items(), key=lambda item: item[1], reverse=True)
+            if not filtered_matches: 
+                continue
+            
+            # Calculate ELO directly without creating new PlayerRankingSystem (avoids recursion)
+            # Initialize all players with default ELO
+            temp_players_elo = {player: self.default_elo for player in all_players}
+            
+            # Process matches chronologically to calculate ELO at end of this week
+            for match in filtered_matches:
+                winner_name = match['winner']
+                loser_name = match['loser']
+                
+                # Get current ELO ratings
+                winner_elo = temp_players_elo[winner_name]
+                loser_elo = temp_players_elo[loser_name]
+                
+                # Calculate new ELO ratings using same formula as main system
+                expected_win = 1 / (1 + 10**((loser_elo - winner_elo) / 400))
+                new_winner_elo = winner_elo + self.k_factor * (1 - expected_win)
+                new_loser_elo = loser_elo + self.k_factor * (0 - (1 - expected_win))
+                
+                # Update ELO ratings
+                temp_players_elo[winner_name] = round(new_winner_elo)
+                temp_players_elo[loser_name] = round(new_loser_elo)
+            
+            # Sort players by ELO and create rankings
+            sorted_players = sorted(temp_players_elo.items(), key=lambda item: item[1], reverse=True)
             
             week_label = (end_of_week - timedelta(days=6)).strftime('Wk %U (%b %d)')
             ranks_for_week = {player: rank + 1 for rank, (player, _) in enumerate(sorted_players)}
@@ -384,27 +345,72 @@ class PlayerRankingSystem:
         plot_df = weekly_rankings_df[weekly_rankings_df.index.isin(active_players)]
         if plot_df.empty or len(plot_df.columns) < 2: return None
 
-        plt.style.use('seaborn-v0_8-whitegrid')
+        # Check if there's meaningful variation in rankings
+        has_variation = False
+        for col in plot_df.columns:
+            unique_ranks = set(plot_df[col][plot_df[col] > 0])
+            if len(unique_ranks) > 1:
+                has_variation = True
+                break
+        
+        if not has_variation:
+            # Skip chart if no meaningful ranking changes
+            return None
+
+        plt.style.use('default')
         fig, ax = plt.subplots(figsize=(12, 8))
+        ax.grid(True, alpha=0.3)
         palette = sns.color_palette("husl", len(plot_df.index))
         
-        plot_df_inv = plot_df.apply(lambda row: [1/r if r > 0 else 0 for r in row], axis=1, result_type='broadcast')
-
-        for i, player in enumerate(plot_df_inv.index):
-            ranks = plot_df_inv.loc[player].values
-            ax.plot(plot_df_inv.columns, ranks, marker='o', linestyle='-', label=player, color=palette[i])
+        # Plot rankings directly (lower rank number = better position = higher on chart)
+        # Invert the y-axis so rank 1 appears at top, rank 10 at bottom
+        max_rank = plot_df[plot_df > 0].max().max()
         
-        current_yticks = ax.get_yticks()
-        filtered_yticks = [y for y in current_yticks if y > 0]
-        ax.set_yticks(filtered_yticks)
-        ax.set_yticklabels([int(round(1/y)) for y in filtered_yticks])
+        for i, player in enumerate(plot_df.index):
+            ranks = plot_df.loc[player].values
+            # Replace 0s (no ranking) with None for cleaner plotting
+            ranks_clean = [r if r > 0 else None for r in ranks]
+            line = ax.plot(plot_df.columns, ranks_clean, marker='o', linestyle='-', 
+                          color=palette[i], linewidth=2, markersize=6)
+            
+            # Add player name at the end of the line (rightmost point)
+            # Find the last non-None value for positioning
+            last_valid_idx = None
+            last_valid_rank = None
+            for j in range(len(ranks_clean) - 1, -1, -1):
+                if ranks_clean[j] is not None:
+                    last_valid_idx = j
+                    last_valid_rank = ranks_clean[j]
+                    break
+            
+            if last_valid_idx is not None:
+                # Position the label slightly to the right of the last point
+                ax.annotate(player, 
+                           xy=(last_valid_idx, last_valid_rank),
+                           xytext=(5, 0), textcoords='offset points',
+                           va='center', ha='left',
+                           fontsize=9, fontweight='bold',
+                           color=palette[i],
+                           bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor=palette[i]))
+        
+        # Set y-axis to show ranks properly (inverted so 1 is at top)
+        ax.invert_yaxis()
+        ax.set_ylim(max_rank + 0.5, 0.5)  # Add padding
+        
+        # Set integer ticks for rankings
+        rank_ticks = list(range(1, int(max_rank) + 1))
+        ax.set_yticks(rank_ticks)
+        ax.set_yticklabels([f"#{r}" for r in rank_ticks])
 
-        ax.legend(title="Players", bbox_to_anchor=(1.05, 1), loc='upper left')
+        # Remove the confusing legend since we have direct labels
+        # ax.legend(title="Players", bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.title("Player Ranking Progression (Last 5 Weeks)", fontsize=18, weight='bold')
-        plt.ylabel("Overall Rank (Lower is Better)")
+        plt.ylabel("Overall Rank (Lower Number = Better)")
         plt.xlabel("Week")
         plt.xticks(rotation=45)
-        plt.tight_layout(rect=[0, 0, 0.85, 1])
+        # Adjust layout to give more space for the right-side labels
+        plt.tight_layout()
+        plt.subplots_adjust(right=0.75)  # Leave space for player name labels
         buf = io.BytesIO()
         plt.savefig(buf, format='png')
         buf.seek(0)
@@ -485,8 +491,9 @@ class PlayerRankingSystem:
             color_matrix.append(color_row)
         
         # Create the visualization
-        plt.style.use('seaborn-v0_8-whitegrid')
+        plt.style.use('default')
         fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+        ax.grid(True, alpha=0.3)
         
         # Convert to DataFrames
         color_df = pd.DataFrame(color_matrix, index=all_players, columns=all_players)
@@ -564,8 +571,9 @@ class PlayerRankingSystem:
         sorted_wins = sorted(wins.items(), key=lambda item: item[1], reverse=True)
         opponents = [item[0] for item in sorted_wins]
         win_counts = [item[1] for item in sorted_wins]
-        plt.style.use('seaborn-v0_8-darkgrid')
+        plt.style.use('default')
         fig, ax = plt.subplots(figsize=(10, 6))
+        ax.grid(True, alpha=0.3)
         sns.barplot(x=win_counts, y=opponents, palette="viridis", ax=ax, orient='h')
         ax.set_title(f"Head-to-Head Wins for {normalized_player_name}", fontsize=16, weight='bold')
         ax.set_xlabel("Number of Wins")
@@ -585,12 +593,6 @@ def get_google_sheets_data(max_retries=5):
     if not GOOGLE_SERVICE_ACCOUNT_FILE:
         logging.error("GOOGLE_SERVICE_ACCOUNT_FILE environment variable is not set. Cannot fetch data.")
         return None
-
-    # Configure SSL context for better compatibility
-    import ssl
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
     
     for attempt in range(max_retries):
         try:
@@ -599,28 +601,13 @@ def get_google_sheets_data(max_retries=5):
             # Define the scope for Google Sheets API
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
             
-            # Authenticate using service account with custom session
+            # Authenticate using service account
             creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scope)
-            
-            # Create a custom session with SSL configuration
-            session = requests.Session()
-            session.verify = False  # Disable SSL verification temporarily
-            
-            # Configure retry strategy for the session
-            retry_strategy = Retry(
-                total=3,
-                backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["HEAD", "GET", "POST"]
-            )
-            adapter = HTTPAdapter(max_retries=retry_strategy)
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
             
             # Disable SSL warnings
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             
-            # Authorize with custom session
+            # Authorize and create client
             client = gspread.authorize(creds)
             
             # Open the spreadsheet and worksheet
@@ -639,7 +626,7 @@ def get_google_sheets_data(max_retries=5):
             
             return records
             
-        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, ssl.SSLError) as e:
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
             logging.warning(f"SSL/Connection error on attempt {attempt + 1}/{max_retries}: {e}")
             if attempt < max_retries - 1:
                 wait_time = min(2 ** attempt, 10)  # Cap wait time at 10 seconds
@@ -838,6 +825,8 @@ def main():
         progression_chart = ranking_system.generate_ranking_progression_chart(active_players, weekly_rankings_df)
         if progression_chart:
             send_telegram_photo(progression_chart, caption="📈 *Ranking Trends*: Check out who's climbing the ranks over the last 5 weeks!")
+        else:
+            send_telegram_message("📊 *Ranking Progression*: Not enough ranking changes over the last 5 weeks to show meaningful trends. Keep playing regularly to see progression!")
 
     # --- All-Time Leaderboard ---
     all_time_lb, all_time_name = ranking_system.generate_leaderboard('all_time')

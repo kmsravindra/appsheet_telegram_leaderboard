@@ -62,3 +62,7 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+*.patch
+
+# Local tracking files
+.installed
